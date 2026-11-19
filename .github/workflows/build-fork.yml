@@ -123,6 +123,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        # gh release create needs a git repo (it resolves the tag via git).
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Determine version
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
