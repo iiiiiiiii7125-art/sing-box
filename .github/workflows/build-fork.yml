@@ -73,9 +73,18 @@ jobs:
         run: |
           set -eu
           echo "--- version gate ---"
-          FIRST_LINE="$(./dist/sing-box version | head -1)"
-          echo "first line: ${FIRST_LINE}"
-          test "${FIRST_LINE}" = "sing-box version ${VERSION}"
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            FIRST_LINE="$(./dist/sing-box version | head -1)"
+            echo "first line: ${FIRST_LINE}"
+            test "${FIRST_LINE}" = "sing-box version ${VERSION}"
+          else
+            # Cross-compiled binary cannot execute on this (amd64) runner;
+            # check the injected version string is embedded instead.
+            strings dist/sing-box | grep -Fq "${VERSION}"
+            echo "version ${VERSION} embedded in ${{ matrix.arch }} binary"
+          fi
+          echo "--- target arch gate ---"
+          go version -m dist/sing-box | grep -F "GOARCH=${{ matrix.arch }}"
           echo "--- patch gate (source) ---"
           grep -q 'make(chan \*N.PacketBuffer, 1024)' common/listener/listener.go
           echo "packetOutbound queue is 1024 in source"
