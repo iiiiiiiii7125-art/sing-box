@@ -1,0 +1,13 @@
+diff --git a/common/listener/listener.go b/common/listener/listener.go
+index 2cbbbab..4076ebd 100644
+--- a/common/listener/listener.go
++++ b/common/listener/listener.go
+@@ -92,7 +92,7 @@ func (l *Listener) Start() error {
+ 			return E.Errors(err, l.Close())
+ 		}
+ 		l.packetOutboundClosed = make(chan struct{})
+-		l.packetOutbound = make(chan *N.PacketBuffer, 64)
++		l.packetOutbound = make(chan *N.PacketBuffer, 1024)
+ 		go l.loopUDPIn()
+ 		if !l.disablePacketOutput {
+ 			go l.loopUDPOut()

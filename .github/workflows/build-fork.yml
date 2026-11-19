@@ -1,0 +1,157 @@
+name: Build fork release
+
+# FLMX fork release pipeline (does NOT reuse upstream build.yml):
+# builds sing-box from this fork, verifies the fork patch, and publishes
+# a formal (non-prerelease, non-draft) GitHub release.
+# Trigger: pushing a tag v*-flmx* (e.g. v1.14.4-flmx1), or manual dispatch.
+
+on:
+  push:
+    tags:
+      - 'v*-flmx*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g. 1.14.4-flmx1, without leading v)'
+        required: true
+        default: '1.14.4-flmx1'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Determine version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ inputs.version }}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          fi
+          echo "VERSION=${VERSION}"
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist
+          # Upstream pure-Go (purego) variant: CGO_ENABLED=0 + DEFAULT_BUILD_TAGS
+          # + with_purego. The bare DEFAULT_BUILD_TAGS cannot build with
+          # CGO_ENABLED=0: cronet-go's cgo file is excluded and its purego
+          # file requires the with_purego tag (proven by local build failure).
+          CGO_ENABLED=0 go build -v -trimpath -o dist/sing-box -tags "$(cat release/DEFAULT_BUILD_TAGS),with_purego" -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' $(cat release/LDFLAGS) -s -w -buildid=" ./cmd/sing-box
+      - name: Extract libcronet.so
+        # Same as upstream purego builds: the purego naive outbound loads
+        # libcronet.so at runtime, so upstream ships it next to the binary.
+        run: |
+          set -xeuo pipefail
+          CRONET_GO_VERSION=$(cat .github/CRONET_GO_VERSION)
+          LIBRARY_PATH="lib/linux_${{ matrix.arch }}/libcronet.so"
+          git init "$RUNNER_TEMP/cronet-go-lib"
+          git -C "$RUNNER_TEMP/cronet-go-lib" remote add origin https://github.com/sagernet/cronet-go.git
+          git -C "$RUNNER_TEMP/cronet-go-lib" sparse-checkout set --no-cone "/$LIBRARY_PATH"
+          git -C "$RUNNER_TEMP/cronet-go-lib" fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
+          git -C "$RUNNER_TEMP/cronet-go-lib" checkout FETCH_HEAD
+          cp "$RUNNER_TEMP/cronet-go-lib/$LIBRARY_PATH" dist/
+      - name: Verify gates
+        run: |
+          set -eu
+          echo "--- version gate ---"
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            FIRST_LINE="$(./dist/sing-box version | head -1)"
+            echo "first line: ${FIRST_LINE}"
+            test "${FIRST_LINE}" = "sing-box version ${VERSION}"
+          else
+            # Cross-compiled binary cannot execute on this (amd64) runner;
+            # check the injected version string is embedded instead.
+            strings dist/sing-box | grep -Fq "${VERSION}"
+            echo "version ${VERSION} embedded in ${{ matrix.arch }} binary"
+          fi
+          echo "--- target arch gate ---"
+          go version -m dist/sing-box | grep -F "GOARCH=${{ matrix.arch }}"
+          echo "--- patch gate (source) ---"
+          grep -q 'make(chan \*N.PacketBuffer, 1024)' common/listener/listener.go
+          echo "packetOutbound queue is 1024 in source"
+          echo "--- go version -m ---"
+          go version -m dist/sing-box
+          echo "--- vcs.revision gate ---"
+          REV="$(go version -m dist/sing-box | sed -n 's/.*revision[^0-9a-f]*\([0-9a-f]\{40\}\).*/\1/p' | head -n 1)"
+          echo "vcs.revision: ${REV}"
+          echo "GITHUB_SHA:   ${GITHUB_SHA}"
+          test -n "${REV}"
+          test "${REV}" = "${GITHUB_SHA}"
+          echo "--- build tags gate ---"
+          go version -m dist/sing-box | grep -F "with_naive_outbound"
+          echo "all gates passed"
+      - name: Package
+        run: |
+          set -eu
+          DIR_NAME="sing-box-${VERSION}-linux-${{ matrix.arch }}"
+          mkdir -p "dist/${DIR_NAME}"
+          cp LICENSE "dist/${DIR_NAME}/LICENSE"
+          cp dist/sing-box "dist/${DIR_NAME}/sing-box"
+          if [ -f dist/libcronet.so ]; then
+            cp dist/libcronet.so "dist/${DIR_NAME}/libcronet.so"
+          fi
+          tar -czvf "dist/sing-box-${VERSION}-linux-${{ matrix.arch }}.tar.gz" -C dist "${DIR_NAME}"
+          ls -l dist/
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-${{ env.VERSION }}-linux-${{ matrix.arch }}
+          path: dist/sing-box-${{ env.VERSION }}-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # gh release create needs a git repo (it resolves the tag via git).
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Determine version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ inputs.version }}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          fi
+          echo "VERSION=${VERSION}"
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sing-box-*
+          merge-multiple: true
+          path: dist
+      - name: Publish formal release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          ls -l dist/
+          test -f "dist/sing-box-${VERSION}-linux-amd64.tar.gz"
+          test -f "dist/sing-box-${VERSION}-linux-arm64.tar.gz"
+          gh release create "v${VERSION}" \
+            --title "sing-box ${VERSION}" \
+            --notes "FLMX fork release of sing-box ${VERSION} (upstream v1.14.4 + UDP packet outbound queue 64 -> 1024)." \
+            "dist/sing-box-${VERSION}-linux-amd64.tar.gz" \
+            "dist/sing-box-${VERSION}-linux-arm64.tar.gz"
